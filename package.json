@@ -1,0 +1,12 @@
+{
+  "name": "llm-interview-proxy",
+  "version": "1.0.0",
+  "description": "Stateless LLM proxy for technical interviews — keeps your real API key server-side",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "devDependencies": {
+    "vercel": "^37.0.0"
+  }
+}
