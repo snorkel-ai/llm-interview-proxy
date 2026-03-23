@@ -10,7 +10,7 @@ They never see your real API key — only the proxy URL and a disposable token.
 # ── Cell 1 (LOCKED — do not modify) ──────────────────────────────────────────
 import requests
 
-BASE_URL = "https://your-proxy.vercel.app"  # ← update after deploying
+BASE_URL = "https://llm-interview-proxy.vercel.app"
 
 # Auto-request an ephemeral session token (expires in 1 hour)
 _resp = requests.post(
