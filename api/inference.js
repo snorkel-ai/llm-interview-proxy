@@ -74,12 +74,29 @@ export default async function handler(req, res) {
   }
 
   const secret = process.env.INTERVIEW_SECRET;
-  const realApiKey = process.env.LLM_API_KEY; // Your real Anthropic key — never exposed
   const llmBaseUrl = process.env.LLM_BASE_URL || "https://api.anthropic.com";
 
-  if (!secret || !realApiKey) {
+  // Support multiple API keys: LLM_API_KEY_1, LLM_API_KEY_2, ... or fallback to LLM_API_KEY
+  const apiKeys = [
+    process.env.LLM_API_KEY_1,
+    process.env.LLM_API_KEY_2,
+    process.env.LLM_API_KEY_3,
+    process.env.LLM_API_KEY_4,
+    process.env.LLM_API_KEY_5,
+    process.env.LLM_API_KEY,
+  ].filter(Boolean);
+
+  if (!secret || apiKeys.length === 0) {
     return res.status(500).json({ error: "Server misconfigured" });
   }
+
+  // Round-robin key selection using a simple counter
+  if (!globalThis._keyIndex) globalThis._keyIndex = 0;
+  const pickKey = () => {
+    const key = apiKeys[globalThis._keyIndex % apiKeys.length];
+    globalThis._keyIndex++;
+    return key;
+  };
 
   // ── 1. Validate ephemeral token ──
   const token = req.headers["x-api-key"];
@@ -127,11 +144,12 @@ export default async function handler(req, res) {
   let upstream, data;
   try {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const apiKey = pickKey(); // rotate key on every attempt
       upstream = await fetch(`${llmBaseUrl}/v1/messages`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-api-key": realApiKey,          // Real key — never sent to candidate
+          "x-api-key": apiKey,              // Real key — never sent to candidate
           "anthropic-version": "2023-06-01",
         },
         body: requestBody,
@@ -139,7 +157,7 @@ export default async function handler(req, res) {
 
       data = await upstream.json();
 
-      // Retry on rate limit (429) or overloaded (529)
+      // Retry on rate limit (429) or overloaded (529) — next attempt uses next key
       if ((upstream.status === 429 || upstream.status === 529) && attempt < MAX_RETRIES) {
         const retryAfter = upstream.headers.get("retry-after");
         const delay = retryAfter
