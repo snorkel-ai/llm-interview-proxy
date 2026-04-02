@@ -66,6 +66,62 @@ function checkRateLimit(token) {
   return true;
 }
 
+// ─── Provider helpers ──────────────────────────────────────────────────────────
+
+async function callAnthropic({ apiKey, baseUrl, model, messages, max_tokens, system, rest }) {
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens,
+      messages,
+      ...(system ? { system } : {}),
+      ...rest,
+    }),
+  });
+  const data = await response.json();
+  return { response, data };
+}
+
+async function callOpenAI({ apiKey, model, messages, max_tokens, system }) {
+  // Convert Anthropic-style system param → OpenAI system message
+  const oaiMessages = system
+    ? [{ role: "system", content: system }, ...messages]
+    : messages;
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ model, messages: oaiMessages, max_tokens }),
+  });
+  const data = await response.json();
+  return { response, data };
+}
+
+function normalizeOpenAIResponse(data, model) {
+  const text = data.choices?.[0]?.message?.content || "";
+  return {
+    response: text,
+    metadata: {
+      request_id: data.id,
+      input_tokens: data.usage?.prompt_tokens,
+      output_tokens: data.usage?.completion_tokens,
+      timestamp: new Date().toISOString(),
+      model_version: data.model,
+      model,
+      provider: "openai",
+    },
+  };
+}
+
 // ─── Main handler ──────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
@@ -74,10 +130,10 @@ export default async function handler(req, res) {
   }
 
   const secret = process.env.INTERVIEW_SECRET;
-  const llmBaseUrl = process.env.LLM_BASE_URL || "https://api.anthropic.com";
+  const anthropicBaseUrl = process.env.LLM_BASE_URL || "https://api.anthropic.com";
 
-  // Support multiple API keys: LLM_API_KEY_1, LLM_API_KEY_2, ... or fallback to LLM_API_KEY
-  const apiKeys = [
+  // Anthropic keys (round-robin)
+  const anthropicKeys = [
     process.env.LLM_API_KEY_1,
     process.env.LLM_API_KEY_2,
     process.env.LLM_API_KEY_3,
@@ -86,15 +142,28 @@ export default async function handler(req, res) {
     process.env.LLM_API_KEY,
   ].filter(Boolean);
 
-  if (!secret || apiKeys.length === 0) {
+  // OpenAI keys (fallback pool)
+  const openaiKeys = [
+    process.env.OPENAI_API_KEY_1,
+    process.env.OPENAI_API_KEY_2,
+    process.env.OPENAI_API_KEY,
+  ].filter(Boolean);
+
+  if (!secret || (anthropicKeys.length === 0 && openaiKeys.length === 0)) {
     return res.status(500).json({ error: "Server misconfigured" });
   }
 
-  // Round-robin key selection using a simple counter
-  if (!globalThis._keyIndex) globalThis._keyIndex = 0;
-  const pickKey = () => {
-    const key = apiKeys[globalThis._keyIndex % apiKeys.length];
-    globalThis._keyIndex++;
+  // Round-robin counters
+  if (!globalThis._anthropicKeyIndex) globalThis._anthropicKeyIndex = 0;
+  if (!globalThis._openaiKeyIndex) globalThis._openaiKeyIndex = 0;
+  const pickAnthropicKey = () => {
+    const key = anthropicKeys[globalThis._anthropicKeyIndex % anthropicKeys.length];
+    globalThis._anthropicKeyIndex++;
+    return key;
+  };
+  const pickOpenAIKey = () => {
+    const key = openaiKeys[globalThis._openaiKeyIndex % openaiKeys.length];
+    globalThis._openaiKeyIndex++;
     return key;
   };
 
@@ -128,68 +197,94 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Body must include a messages array" });
   }
 
-  // Force a safe model if you want to lock candidates to a specific one
-  const allowedModel = process.env.FORCED_MODEL || model || "claude-sonnet-4-20250514";
+  const anthropicModel = process.env.FORCED_MODEL || model || "claude-sonnet-4-20250514";
+  const openaiModel = process.env.OPENAI_FALLBACK_MODEL || "gpt-4o";
 
-  // ── 5. Proxy to Anthropic (with retry on 429/529) ──
   const MAX_RETRIES = 5;
-  const requestBody = JSON.stringify({
-    model: allowedModel,
-    max_tokens,
-    messages,
-    ...(system ? { system } : {}),
-    ...rest,
-  });
 
-  let upstream, data;
   try {
+    // ── 5a. Try Anthropic first ──
+    if (anthropicKeys.length > 0) {
+      let upstream, data;
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        ({ response: upstream, data } = await callAnthropic({
+          apiKey: pickAnthropicKey(),
+          baseUrl: anthropicBaseUrl,
+          model: anthropicModel,
+          messages,
+          max_tokens,
+          system,
+          rest,
+        }));
+
+        if ((upstream.status === 429 || upstream.status === 529) && attempt < MAX_RETRIES) {
+          const retryAfter = upstream.headers.get("retry-after");
+          const delay = retryAfter
+            ? Number(retryAfter) * 1000
+            : Math.min(1000 * 2 ** attempt + Math.random() * 500, 30000);
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        break;
+      }
+
+      if (upstream.ok) {
+        const responseText =
+          data.content?.map((b) => (b.type === "text" ? b.text : "")).join("") || "";
+        return res.status(200).json({
+          response: responseText,
+          metadata: {
+            request_id: data.id,
+            input_tokens: data.usage?.input_tokens,
+            output_tokens: data.usage?.output_tokens,
+            timestamp: new Date().toISOString(),
+            model_version: data.model,
+            model: anthropicModel,
+            provider: "anthropic",
+          },
+        });
+      }
+
+      // Non-429 Anthropic error with no OpenAI fallback → return it
+      if ((upstream.status !== 429 && upstream.status !== 529) || openaiKeys.length === 0) {
+        return res.status(upstream.status).json({ error: data });
+      }
+
+      console.warn(`Anthropic exhausted (${upstream.status}), falling back to OpenAI`);
+    }
+
+    // ── 5b. Fallback to OpenAI ──
+    if (openaiKeys.length === 0) {
+      return res.status(503).json({ error: "All providers unavailable" });
+    }
+
+    let oaiUpstream, oaiData;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      const apiKey = pickKey(); // rotate key on every attempt
-      upstream = await fetch(`${llmBaseUrl}/v1/messages`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,              // Real key — never sent to candidate
-          "anthropic-version": "2023-06-01",
-        },
-        body: requestBody,
-      });
+      ({ response: oaiUpstream, data: oaiData } = await callOpenAI({
+        apiKey: pickOpenAIKey(),
+        model: openaiModel,
+        messages,
+        max_tokens,
+        system,
+      }));
 
-      data = await upstream.json();
-
-      // Retry on rate limit (429) or overloaded (529) — next attempt uses next key
-      if ((upstream.status === 429 || upstream.status === 529) && attempt < MAX_RETRIES) {
-        const retryAfter = upstream.headers.get("retry-after");
+      if ((oaiUpstream.status === 429) && attempt < MAX_RETRIES) {
+        const retryAfter = oaiUpstream.headers.get("retry-after");
         const delay = retryAfter
           ? Number(retryAfter) * 1000
           : Math.min(1000 * 2 ** attempt + Math.random() * 500, 30000);
         await new Promise((r) => setTimeout(r, delay));
         continue;
       }
-
       break;
     }
 
-    if (!upstream.ok) {
-      return res.status(upstream.status).json({ error: data });
+    if (!oaiUpstream.ok) {
+      return res.status(oaiUpstream.status).json({ error: oaiData });
     }
 
-    // ── 6. Return in your original snorkel-a1 response shape ──
-    //    So candidates don't need to change their parsing code
-    const responseText =
-      data.content?.map((b) => (b.type === "text" ? b.text : "")).join("") || "";
+    return res.status(200).json(normalizeOpenAIResponse(oaiData, openaiModel));
 
-    return res.status(200).json({
-      response: responseText,
-      metadata: {
-        request_id: data.id,
-        input_tokens: data.usage?.input_tokens,
-        output_tokens: data.usage?.output_tokens,
-        timestamp: new Date().toISOString(),
-        model_version: data.model,
-        model: allowedModel,
-      },
-    });
   } catch (err) {
     console.error("Upstream LLM error:", err);
     return res.status(502).json({ error: "Upstream LLM request failed" });
