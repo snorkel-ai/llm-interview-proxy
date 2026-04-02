@@ -68,8 +68,17 @@ function checkRateLimit(token) {
 
 // ─── Provider helpers ──────────────────────────────────────────────────────────
 
+const FETCH_TIMEOUT_MS = 20000; // 20s per individual request
+
+function fetchWithTimeout(url, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
 async function callAnthropic({ apiKey, baseUrl, model, messages, max_tokens, system, rest }) {
-  const response = await fetch(`${baseUrl}/v1/messages`, {
+  const response = await fetchWithTimeout(`${baseUrl}/v1/messages`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -94,7 +103,7 @@ async function callOpenAI({ apiKey, model, messages, max_tokens, system }) {
     ? [{ role: "system", content: system }, ...messages]
     : messages;
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+  const response = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
