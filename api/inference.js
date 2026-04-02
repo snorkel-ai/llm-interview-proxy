@@ -57,7 +57,7 @@ function validateToken(token, secret) {
 // ─── Rate-limit guard (simple in-memory — resets per cold start) ──────────────
 // For production, swap this with Vercel KV or Upstash Redis.
 const requestCounts = new Map();
-const RATE_LIMIT = Number(process.env.RATE_LIMIT_PER_TOKEN) || 50; // max requests per token lifetime
+const RATE_LIMIT = Number(process.env.RATE_LIMIT_PER_TOKEN) || 200; // max requests per token lifetime
 
 function checkRateLimit(token) {
   const count = requestCounts.get(token) || 0;
@@ -114,25 +114,43 @@ export default async function handler(req, res) {
   // Force a safe model if you want to lock candidates to a specific one
   const allowedModel = process.env.FORCED_MODEL || model || "claude-sonnet-4-20250514";
 
-  // ── 5. Proxy to Anthropic ──
-  try {
-    const upstream = await fetch(`${llmBaseUrl}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": realApiKey,          // Real key — never sent to candidate
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: allowedModel,
-        max_tokens,
-        messages,
-        ...(system ? { system } : {}),
-        ...rest,
-      }),
-    });
+  // ── 5. Proxy to Anthropic (with retry on 429/529) ──
+  const MAX_RETRIES = 5;
+  const requestBody = JSON.stringify({
+    model: allowedModel,
+    max_tokens,
+    messages,
+    ...(system ? { system } : {}),
+    ...rest,
+  });
 
-    const data = await upstream.json();
+  let upstream, data;
+  try {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      upstream = await fetch(`${llmBaseUrl}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": realApiKey,          // Real key — never sent to candidate
+          "anthropic-version": "2023-06-01",
+        },
+        body: requestBody,
+      });
+
+      data = await upstream.json();
+
+      // Retry on rate limit (429) or overloaded (529)
+      if ((upstream.status === 429 || upstream.status === 529) && attempt < MAX_RETRIES) {
+        const retryAfter = upstream.headers.get("retry-after");
+        const delay = retryAfter
+          ? Number(retryAfter) * 1000
+          : Math.min(1000 * 2 ** attempt + Math.random() * 500, 30000);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+
+      break;
+    }
 
     if (!upstream.ok) {
       return res.status(upstream.status).json({ error: data });
