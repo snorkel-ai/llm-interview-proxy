@@ -191,10 +191,17 @@ export default async function handler(req, res) {
   }
 
   // ── 4. Parse and sanitize the request body ──
-  const { model, messages, max_tokens = 1024, system, ...rest } = req.body || {};
+  const { model, messages: rawMessages, prompt, max_tokens = 1024, system, ...rest } = req.body || {};
 
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: "Body must include a messages array" });
+  // Accept either a messages array OR a plain prompt string
+  const messages = rawMessages && Array.isArray(rawMessages)
+    ? rawMessages
+    : prompt
+      ? [{ role: "user", content: String(prompt) }]
+      : null;
+
+  if (!messages) {
+    return res.status(400).json({ error: "Body must include a messages array or a prompt string" });
   }
 
   const openaiModel = process.env.OPENAI_PRIMARY_MODEL || "gpt-4o";
