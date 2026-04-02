@@ -132,21 +132,21 @@ export default async function handler(req, res) {
   const secret = process.env.INTERVIEW_SECRET;
   const anthropicBaseUrl = process.env.LLM_BASE_URL || "https://api.anthropic.com";
 
-  // Anthropic keys (round-robin)
+  // OpenAI keys — primary provider (round-robin)
+  const openaiKeys = [
+    process.env.OPENAI_API_KEY,
+    process.env.OPENAI_API_KEY_1,
+    process.env.OPENAI_API_KEY_2,
+  ].filter(Boolean);
+
+  // Anthropic keys — fallback provider
   const anthropicKeys = [
+    process.env.LLM_API_KEY,
     process.env.LLM_API_KEY_1,
     process.env.LLM_API_KEY_2,
     process.env.LLM_API_KEY_3,
     process.env.LLM_API_KEY_4,
     process.env.LLM_API_KEY_5,
-    process.env.LLM_API_KEY,
-  ].filter(Boolean);
-
-  // OpenAI keys (fallback pool)
-  const openaiKeys = [
-    process.env.OPENAI_API_KEY_1,
-    process.env.OPENAI_API_KEY_2,
-    process.env.OPENAI_API_KEY,
   ].filter(Boolean);
 
   if (!secret || (anthropicKeys.length === 0 && openaiKeys.length === 0)) {
@@ -197,28 +197,26 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Body must include a messages array" });
   }
 
-  const anthropicModel = process.env.FORCED_MODEL || model || "claude-sonnet-4-20250514";
-  const openaiModel = process.env.OPENAI_FALLBACK_MODEL || "gpt-4o";
+  const openaiModel = process.env.OPENAI_PRIMARY_MODEL || "gpt-4o";
+  const anthropicModel = process.env.ANTHROPIC_FALLBACK_MODEL || model || "claude-sonnet-4-20250514";
 
   const MAX_RETRIES = 5;
 
   try {
-    // ── 5a. Try Anthropic first ──
-    if (anthropicKeys.length > 0) {
-      let upstream, data;
+    // ── 5a. Try OpenAI first ──
+    if (openaiKeys.length > 0) {
+      let oaiUpstream, oaiData;
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        ({ response: upstream, data } = await callAnthropic({
-          apiKey: pickAnthropicKey(),
-          baseUrl: anthropicBaseUrl,
-          model: anthropicModel,
+        ({ response: oaiUpstream, data: oaiData } = await callOpenAI({
+          apiKey: pickOpenAIKey(),
+          model: openaiModel,
           messages,
           max_tokens,
           system,
-          rest,
         }));
 
-        if ((upstream.status === 429 || upstream.status === 529) && attempt < MAX_RETRIES) {
-          const retryAfter = upstream.headers.get("retry-after");
+        if (oaiUpstream.status === 429 && attempt < MAX_RETRIES) {
+          const retryAfter = oaiUpstream.headers.get("retry-after");
           const delay = retryAfter
             ? Number(retryAfter) * 1000
             : Math.min(1000 * 2 ** attempt + Math.random() * 500, 30000);
@@ -228,48 +226,37 @@ export default async function handler(req, res) {
         break;
       }
 
-      if (upstream.ok) {
-        const responseText =
-          data.content?.map((b) => (b.type === "text" ? b.text : "")).join("") || "";
-        return res.status(200).json({
-          response: responseText,
-          metadata: {
-            request_id: data.id,
-            input_tokens: data.usage?.input_tokens,
-            output_tokens: data.usage?.output_tokens,
-            timestamp: new Date().toISOString(),
-            model_version: data.model,
-            model: anthropicModel,
-            provider: "anthropic",
-          },
-        });
+      if (oaiUpstream.ok) {
+        return res.status(200).json(normalizeOpenAIResponse(oaiData, openaiModel));
       }
 
-      // Non-429 Anthropic error with no OpenAI fallback → return it
-      if ((upstream.status !== 429 && upstream.status !== 529) || openaiKeys.length === 0) {
-        return res.status(upstream.status).json({ error: data });
+      // Non-429 OpenAI error with no Anthropic fallback → return it
+      if (oaiUpstream.status !== 429 || anthropicKeys.length === 0) {
+        return res.status(oaiUpstream.status).json({ error: oaiData });
       }
 
-      console.warn(`Anthropic exhausted (${upstream.status}), falling back to OpenAI`);
+      console.warn(`OpenAI exhausted (${oaiUpstream.status}), falling back to Anthropic`);
     }
 
-    // ── 5b. Fallback to OpenAI ──
-    if (openaiKeys.length === 0) {
+    // ── 5b. Fallback to Anthropic ──
+    if (anthropicKeys.length === 0) {
       return res.status(503).json({ error: "All providers unavailable" });
     }
 
-    let oaiUpstream, oaiData;
+    let upstream, data;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      ({ response: oaiUpstream, data: oaiData } = await callOpenAI({
-        apiKey: pickOpenAIKey(),
-        model: openaiModel,
+      ({ response: upstream, data } = await callAnthropic({
+        apiKey: pickAnthropicKey(),
+        baseUrl: anthropicBaseUrl,
+        model: anthropicModel,
         messages,
         max_tokens,
         system,
+        rest,
       }));
 
-      if ((oaiUpstream.status === 429) && attempt < MAX_RETRIES) {
-        const retryAfter = oaiUpstream.headers.get("retry-after");
+      if ((upstream.status === 429 || upstream.status === 529) && attempt < MAX_RETRIES) {
+        const retryAfter = upstream.headers.get("retry-after");
         const delay = retryAfter
           ? Number(retryAfter) * 1000
           : Math.min(1000 * 2 ** attempt + Math.random() * 500, 30000);
@@ -279,11 +266,24 @@ export default async function handler(req, res) {
       break;
     }
 
-    if (!oaiUpstream.ok) {
-      return res.status(oaiUpstream.status).json({ error: oaiData });
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({ error: data });
     }
 
-    return res.status(200).json(normalizeOpenAIResponse(oaiData, openaiModel));
+    const responseText =
+      data.content?.map((b) => (b.type === "text" ? b.text : "")).join("") || "";
+    return res.status(200).json({
+      response: responseText,
+      metadata: {
+        request_id: data.id,
+        input_tokens: data.usage?.input_tokens,
+        output_tokens: data.usage?.output_tokens,
+        timestamp: new Date().toISOString(),
+        model_version: data.model,
+        model: anthropicModel,
+        provider: "anthropic",
+      },
+    });
 
   } catch (err) {
     console.error("Upstream LLM error:", err);
