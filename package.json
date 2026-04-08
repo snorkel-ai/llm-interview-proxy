@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vercel dev"
   },
+  "dependencies": {
+    "portkey-ai": "^1.0.0"
+  },
   "devDependencies": {
     "vercel": "^37.0.0"
   }

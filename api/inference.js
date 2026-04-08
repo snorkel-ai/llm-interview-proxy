@@ -47,30 +47,45 @@ function checkRateLimit(token) {
   return true;
 }
 
-// ─── Anthropic call with per-request timeout ──────────────────────────────────
-async function callAnthropic({ apiKey, model, messages, max_tokens, system, rest }) {
+// ─── Portkey call (raw fetch — SDK doesn't forward custom headers reliably) ───
+// modelSpec: "@virtualkey/modelname" or plain model string.
+async function callPortkey({ apiKey, modelSpec, messages, max_tokens, system }) {
+  modelSpec = modelSpec.trim();
+  let virtualKey, model;
+  if (modelSpec.startsWith("@")) {
+    const slash = modelSpec.indexOf("/", 1);
+    virtualKey = modelSpec.slice(1, slash !== -1 ? slash : undefined);
+    model = slash !== -1 ? modelSpec.slice(slash + 1) : modelSpec.slice(1);
+  } else {
+    model = modelSpec;
+  }
+
+  const fullMessages = system
+    ? [{ role: "system", content: system }, ...messages]
+    : messages;
+
+  // Default virtual key — all models route through anthropic-marlin-tuna unless overridden
+  const resolvedVirtualKey = virtualKey || "anthropic-marlin-tuna";
+
+  const headers = {
+    "Content-Type": "application/json",
+    "x-portkey-api-key": apiKey,
+    "x-portkey-virtual-key": resolvedVirtualKey,
+  };
+
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000); // 15s hard timeout
+  const timer = setTimeout(() => controller.abort(), 20000);
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await fetch("https://api.portkey.ai/v1/chat/completions", {
       method: "POST",
       signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens,
-        messages,
-        ...(system ? { system } : {}),
-        ...rest,
-      }),
+      headers,
+      body: JSON.stringify({ model, messages: fullMessages, max_tokens }),
     });
-    const data = await response.json();
-    return { response, data };
+    const data = await res.json();
+    if (!res.ok) throw Object.assign(new Error(data?.message || "Portkey error"), { status: res.status });
+    return data;
   } finally {
     clearTimeout(timer);
   }
@@ -84,27 +99,11 @@ export default async function handler(req, res) {
   }
 
   const secret = process.env.INTERVIEW_SECRET;
+  const portkeyApiKey = process.env.PORTKEY_API_KEY;
 
-  // All Anthropic keys — round-robined to spread rate limit across keys
-  const anthropicKeys = [
-    process.env.LLM_API_KEY,
-    process.env.LLM_API_KEY_1,
-    process.env.LLM_API_KEY_2,
-    process.env.LLM_API_KEY_3,
-    process.env.LLM_API_KEY_4,
-    process.env.LLM_API_KEY_5,
-  ].filter(Boolean);
-
-  if (!secret || anthropicKeys.length === 0) {
+  if (!secret || !portkeyApiKey) {
     return res.status(500).json({ error: "Server misconfigured" });
   }
-
-  if (!globalThis._keyIndex) globalThis._keyIndex = 0;
-  const pickKey = () => {
-    const key = anthropicKeys[globalThis._keyIndex % anthropicKeys.length];
-    globalThis._keyIndex++;
-    return key;
-  };
 
   // ── 1. Validate token ──
   const token = req.headers["x-api-key"];
@@ -128,8 +127,8 @@ export default async function handler(req, res) {
     return res.status(429).json({ error: `Rate limit exceeded: max ${RATE_LIMIT} requests per token` });
   }
 
-  // ── 4. Parse body — accept messages array OR plain prompt string ──
-  const { model, messages: rawMessages, prompt, max_tokens = 1024, system, ...rest } = req.body || {};
+  // ── 4. Parse body ──
+  const { model, messages: rawMessages, prompt, max_tokens = 1024, system } = req.body || {};
 
   const messages = Array.isArray(rawMessages) && rawMessages.length > 0
     ? rawMessages
@@ -141,55 +140,58 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Body must include a messages array or a prompt string" });
   }
 
-  const anthropicModel = process.env.ANTHROPIC_MODEL || model || "claude-haiku-4-5-20251001";
+  // Model priority: env override → request model → Anthropic → OpenAI
+  const modelCandidates = [
+    process.env.ANTHROPIC_MODEL || "@anthropic-marlin-tuna/claude-sonnet-4-6",
+    "@anthropic-marlin-tuna/claude-sonnet-4-5",
+    "@openai/gpt-4.1",
+  ];
 
-  // ── 5. Call Anthropic — rotate keys on each retry, no long waits ──
-  const MAX_RETRIES = 4;
+  if (process.env.FORCED_MODEL) {
+    modelCandidates.unshift(process.env.FORCED_MODEL);
+  } else if (model) {
+    modelCandidates.unshift(model);
+  }
 
-  try {
-    let upstream, data;
+  // ── 5. Call Portkey — try models in order until one succeeds ──
+  const tried = new Set();
 
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      ({ response: upstream, data } = await callAnthropic({
-        apiKey: pickKey(),
-        model: anthropicModel,
+  for (const candidate of modelCandidates) {
+    if (tried.has(candidate)) continue;
+    tried.add(candidate);
+
+    try {
+      const completion = await callPortkey({
+        apiKey: portkeyApiKey,
+        modelSpec: candidate,
         messages,
         max_tokens,
         system,
-        rest,
-      }));
+      });
 
-      if ((upstream.status === 429 || upstream.status === 529) && attempt < MAX_RETRIES) {
-        // Respect retry-after if given, otherwise wait 1s then try next key
-        const retryAfter = upstream.headers.get("retry-after");
-        const delay = retryAfter ? Number(retryAfter) * 1000 : 1000;
-        await new Promise((r) => setTimeout(r, delay));
-        continue;
+      const responseText = completion.choices?.[0]?.message?.content || "";
+
+      return res.status(200).json({
+        response: responseText,
+        metadata: {
+          request_id: completion.id,
+          input_tokens: completion.usage?.prompt_tokens,
+          output_tokens: completion.usage?.completion_tokens,
+          timestamp: new Date().toISOString(),
+          model_version: completion.model,
+          model: candidate,
+        },
+      });
+    } catch (err) {
+      const status = err?.status || err?.response?.status;
+      console.error(`Portkey call failed [${candidate}]:`, err?.message || err);
+      // On rate-limit or server error, try next model; otherwise bail
+      if (status && status !== 429 && status !== 529 && status !== 503) {
+        return res.status(status).json({ error: err?.message || "LLM request failed" });
       }
-      break;
+      // rate-limited / overloaded — fall through to next candidate
     }
-
-    if (!upstream.ok) {
-      return res.status(upstream.status).json({ error: data });
-    }
-
-    const responseText =
-      data.content?.map((b) => (b.type === "text" ? b.text : "")).join("") || "";
-
-    return res.status(200).json({
-      response: responseText,
-      metadata: {
-        request_id: data.id,
-        input_tokens: data.usage?.input_tokens,
-        output_tokens: data.usage?.output_tokens,
-        timestamp: new Date().toISOString(),
-        model_version: data.model,
-        model: anthropicModel,
-      },
-    });
-
-  } catch (err) {
-    console.error("Anthropic error:", err);
-    return res.status(502).json({ error: "LLM request failed" });
   }
+
+  return res.status(502).json({ error: "All LLM providers exhausted" });
 }

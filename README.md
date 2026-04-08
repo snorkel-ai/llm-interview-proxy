@@ -1,17 +1,18 @@
 # LLM Interview Proxy
 
 A stateless, zero-database LLM proxy for technical interviews.  
-Candidates get ephemeral tokens. Your real API key never leaves Vercel.
+Candidates get ephemeral tokens. Your real API key never leaves Vercel.  
+All LLM traffic is routed through **[Portkey](https://portkey.ai)** for observability, fallbacks, and cost control.
 
 ---
 
 ## How the Token System Works
 
 ```
-You (interviewer)          Vercel (your proxy)          Anthropic API
+You (interviewer)          Vercel (your proxy)          Portkey → LLM
       │                          │                            │
       │  Set INTERVIEW_SECRET    │                            │
-      │  Set LLM_API_KEY ──────► │ (stored in env vars)      │
+      │  Set PORTKEY_API_KEY ──► │ (stored in env vars)      │
       │                          │                            │
 Candidate hits CodePad:          │                            │
       │                          │                            │
@@ -22,7 +23,7 @@ Candidate hits CodePad:          │                            │
       ├─ POST /api/inference ───►│                            │
       │   X-API-Key: tok_...     │ validate HMAC signature    │
       │   (their prompt)         ├──────────────────────────►│
-      │                          │   real LLM_API_KEY (hidden)│
+      │                          │   real PORTKEY_API_KEY     │
       │◄─ { response: "..." } ───┤◄──────────────────────────┤
 ```
 
@@ -46,7 +47,7 @@ No Redis, no Postgres, no state anywhere.
 ### Step 1 — Clone and push to GitHub
 
 ```bash
-git clone https://github.com/your-org/llm-interview-proxy
+git clone https://github.com/snorkel-ai/llm-interview-proxy
 cd llm-interview-proxy
 # push to your own repo
 ```
@@ -67,11 +68,11 @@ Go to **Vercel Dashboard → Your Project → Settings → Environment Variables
 | Variable | Value | Notes |
 |---|---|---|
 | `INTERVIEW_SECRET` | `openssl rand -hex 32` | Random 64-char hex — generate once, never share |
-| `LLM_API_KEY` | `sk-ant-...` | Your real Anthropic API key |
-| `LLM_BASE_URL` | `https://api.anthropic.com` | Or your custom LLM host |
-| `FORCED_MODEL` | `claude-sonnet-4-20250514` | Optional: lock candidates to one model |
+| `PORTKEY_API_KEY` | `pk-...` | Your Portkey API key |
+| `ANTHROPIC_MODEL` | `@anthropic-marlin-tuna/claude-sonnet-4-6` | Optional: default model via Portkey virtual key |
+| `FORCED_MODEL` | `@anthropic-marlin-tuna/claude-sonnet-4-6` | Optional: lock all candidates to one model |
 | `RATE_LIMIT_PER_TOKEN` | `100` | Optional: max requests per token |
-| `ALLOWED_USE_CASE_PATTERN` | `team-` | Optional: only allow team-* use-case IDs |
+| `ALLOWED_USE_CASE_PATTERN` | `team-` | Optional: only allow `team-*` use-case IDs |
 
 ### Step 4 — Generate your INTERVIEW_SECRET
 
@@ -86,12 +87,30 @@ This is the **only secret you ever manage.** The token candidates receive is der
 
 ---
 
+## Portkey Model Spec Format
+
+Models are specified as `@virtualkey/modelname`. The virtual key maps to credentials configured in your Portkey dashboard.
+
+Examples:
+- `@anthropic-marlin-tuna/claude-sonnet-4-6` — Claude Sonnet via the `anthropic-marlin-tuna` virtual key
+- `@openai/gpt-4.1` — GPT-4.1 via the `openai` virtual key
+- `claude-haiku-4-5` — plain model name, uses the default virtual key
+
+The proxy tries models in this order until one succeeds (rate-limit fallback):
+1. `FORCED_MODEL` env var (if set)
+2. `model` field from the request body (if provided)
+3. `ANTHROPIC_MODEL` env var (default: `@anthropic-marlin-tuna/claude-sonnet-4-6`)
+4. `@anthropic-marlin-tuna/claude-sonnet-4-5` (fallback)
+5. `@openai/gpt-4.1` (final fallback)
+
+---
+
 ## How to Run an Interview Cohort
 
 ### Per cohort (e.g. every hiring batch):
 
 1. Nothing to rotate — tokens expire automatically by TTL
-2. Optionally change `use_case_id` per cohort (e.g. `team-jan2026`) for log filtering
+2. Optionally change `use_case_id` per cohort (e.g. `team-jan2026`) for log filtering in Portkey
 
 ### Per candidate:
 
@@ -132,7 +151,7 @@ Generates an ephemeral signed token.
 
 ### `POST /api/inference`
 
-Proxies to Anthropic. Response shape matches your original `snorkel-a1` format.
+Proxies to Portkey → LLM. Response shape matches the original `snorkel-a1` format.
 
 **Required headers:**
 ```
@@ -144,11 +163,19 @@ Content-Type: application/json
 **Request body:**
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
+  "model": "@anthropic-marlin-tuna/claude-sonnet-4-6",
   "max_tokens": 512,
   "messages": [
     { "role": "user", "content": "Your prompt here" }
   ]
+}
+```
+
+You can also pass a plain `prompt` string instead of `messages`:
+```json
+{
+  "prompt": "Your prompt here",
+  "max_tokens": 512
 }
 ```
 
@@ -157,12 +184,12 @@ Content-Type: application/json
 {
   "response": "The extracted entities are...",
   "metadata": {
-    "request_id": "msg_01...",
+    "request_id": "chatcmpl-...",
     "input_tokens": 142,
     "output_tokens": 38,
-    "timestamp": "2026-03-23T12:00:00.000Z",
-    "model_version": "claude-sonnet-4-20250514",
-    "model": "claude-sonnet-4-20250514"
+    "timestamp": "2026-04-08T12:00:00.000Z",
+    "model_version": "claude-sonnet-4-6-20250514",
+    "model": "@anthropic-marlin-tuna/claude-sonnet-4-6"
   }
 }
 ```
@@ -180,15 +207,14 @@ vercel dev
 You'll need a `.env.local` file:
 ```
 INTERVIEW_SECRET=your-local-secret
-LLM_API_KEY=sk-ant-...
-LLM_BASE_URL=https://api.anthropic.com
+PORTKEY_API_KEY=pk-...
 ```
 
 ---
 
 ## Cost Control Tips
 
-- Set `max_tokens` in `FORCED_MODEL` logic to cap output length
-- Set `RATE_LIMIT_PER_TOKEN` to limit requests per session
-- Monitor spend in Anthropic console — filter by date to see interview days
-- Use `claude-haiku-3-5` instead of Sonnet for cheap high-volume interviews
+- Set `RATE_LIMIT_PER_TOKEN` to limit requests per session (default: 500)
+- Use `FORCED_MODEL` to lock candidates to a cheaper model (e.g. `@anthropic-marlin-tuna/claude-haiku-4-5`)
+- Monitor spend and request logs in the **Portkey dashboard** — filter by virtual key or date to see interview days
+- The automatic fallback chain means a rate-limited model won't block candidates; Portkey logs show which model was ultimately used
